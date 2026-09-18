@@ -1,0 +1,215 @@
+diff --git a/src/linuwu_sense.c b/src/linuwu_sense.c
+index 025eacb..c1673a4 100644
+--- a/src/linuwu_sense.c
++++ b/src/linuwu_sense.c
+@@ -33,9 +33,22 @@
+  #include <linux/hwmon.h>
+  #include <linux/fs.h>
+  #include <linux/units.h>
++ #include <linux/version.h>
++ #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+  #include <linux/unaligned.h>
++ #else
++ #include <asm/unaligned.h>
++ #endif
+  #include <linux/bitfield.h>
+  #include <linux/bitmap.h>
++
++ /*
++  * Upstream tracks kernel 6.14+. The guards below keep the module building on
++  * older kernels, where the equivalent APIs differ.
++  */
++ #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 13, 0)
++ #define BACKLIGHT_POWER_ON FB_BLANK_UNBLANK
++ #endif
+  
+  MODULE_AUTHOR("Carlos Corbacho");
+  MODULE_DESCRIPTION("Acer Laptop WMI Extras Driver");
+@@ -805,6 +818,15 @@ enum acer_wmi_predator_v4_oc {
+          },
+          .driver_data = &quirk_acer_predator_v4,
+      },
++     {
++         .callback = dmi_matched,
++         .ident = "Acer Predator PH16-72",
++         .matches = {
++             DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
++             DMI_MATCH(DMI_PRODUCT_NAME, "Predator PH16-72"),
++         },
++         .driver_data = &quirk_acer_predator_v4,
++     },
+      {
+          .callback = dmi_matched,
+          .ident = "Acer Predator PH18-71",
+@@ -936,7 +958,9 @@ enum acer_wmi_predator_v4_oc {
+      {}
+  };
+  
++ #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0)
+  static struct device *platform_profile_device;
++ #endif
+  static bool platform_profile_support;
+  
+  /*
+@@ -2315,28 +2339,85 @@ enum acer_wmi_predator_v4_oc {
+  
+  static acpi_status battery_health_set(u8 function, u8 function_status);
+  
++ #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0)
+  static const struct platform_profile_ops acer_predator_v4_platform_profile_ops = {
+      .probe = acer_predator_v4_platform_profile_probe,
+      .profile_get = acer_predator_v4_platform_profile_get,
+      .profile_set = acer_predator_v4_platform_profile_set,
+  };
++
++ static int acer_platform_profile_try_register(struct platform_device *pdev)
++ {
++     platform_profile_device = devm_platform_profile_register(
++         &pdev->dev, "acer-wmi", NULL, &acer_predator_v4_platform_profile_ops);
++
++     return PTR_ERR_OR_ZERO(platform_profile_device);
++ }
++
++ static void acer_platform_profile_teardown(void)
++ {
++ }
++ #else
++ static int acer_pprof_get_legacy(struct platform_profile_handler *pprof,
++                  enum platform_profile_option *profile)
++ {
++     return acer_predator_v4_platform_profile_get(NULL, profile);
++ }
++
++ static int acer_pprof_set_legacy(struct platform_profile_handler *pprof,
++                  enum platform_profile_option profile)
++ {
++     return acer_predator_v4_platform_profile_set(NULL, profile);
++ }
++
++ static struct platform_profile_handler acer_predator_v4_platform_profile_handler = {
++     .profile_get = acer_pprof_get_legacy,
++     .profile_set = acer_pprof_set_legacy,
++ };
++
++ /* Pre-6.14 has no .probe hook, so fill the choices bitmap before registering. */
++ static int acer_platform_profile_try_register(struct platform_device *pdev)
++ {
++     int err;
++
++     bitmap_zero(acer_predator_v4_platform_profile_handler.choices,
++             PLATFORM_PROFILE_LAST);
++
++     err = acer_predator_v4_platform_profile_probe(
++         NULL, acer_predator_v4_platform_profile_handler.choices);
++     if (err)
++         return err;
++
++     return platform_profile_register(&acer_predator_v4_platform_profile_handler);
++ }
++
++ /* Registration is not devm-managed before 6.14, so unwind it explicitly. */
++ static void acer_platform_profile_teardown(void)
++ {
++     if (platform_profile_support) {
++         platform_profile_remove();
++         platform_profile_support = false;
++     }
++ }
++ #endif
+  
+  static int acer_platform_profile_setup(struct platform_device *pdev)
+  {
+      const int max_retries = 10;
+      int delay_ms = 100;
++     int err;
++
+      if (!quirks->predator_v4 && !quirks->nitro_sense && !quirks->nitro_v4)
+          return 0;
+      for (int attempt = 1; attempt <= max_retries; attempt++) {
+-         platform_profile_device = devm_platform_profile_register(
+-             &pdev->dev, "acer-wmi", NULL, &acer_predator_v4_platform_profile_ops);
+-         if (!IS_ERR(platform_profile_device)) {
++         err = acer_platform_profile_try_register(pdev);
++         if (!err) {
+              platform_profile_support = true;
+              pr_info("Platform profile registered successfully (attempt %d)\n", attempt);
+              return 0;
+          }
+          pr_warn("Platform profile registration failed (attempt %d/%d), error: %ld\n",
+-                 attempt, max_retries, PTR_ERR(platform_profile_device));
++                 attempt, max_retries, (long)err);
+          if (attempt < max_retries) {
+              msleep(delay_ms);
+              delay_ms = min(delay_ms * 2, 1000);
+@@ -2423,7 +2504,11 @@ enum acer_wmi_predator_v4_oc {
+          if (tp != acer_predator_v4_max_perf)
+              last_non_turbo_profile = tp;
+  
++ #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0)
+          platform_profile_notify(platform_profile_device);
++ #else
++         platform_profile_notify();
++ #endif
+      }
+  
+      return 0;
+@@ -2890,6 +2975,29 @@ enum acer_wmi_predator_v4_oc {
+      return err;
+  }
+  
++ #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 9, 0)
++ #define acer_wmi_notify_handler acer_wmi_notify
++ #else
++ /*
++  * Before 6.9 the notify handler receives only an event id and has to fetch
++  * the payload itself.
++  */
++ static void acer_wmi_notify_handler(u32 value, void *context)
++ {
++     struct acpi_buffer response = { ACPI_ALLOCATE_BUFFER, NULL };
++     acpi_status status;
++
++     status = wmi_get_event_data(value, &response);
++     if (ACPI_FAILURE(status)) {
++         pr_warn("Failed to get WMI event data");
++         return;
++     }
++
++     acer_wmi_notify(response.pointer, context);
++     kfree(response.pointer);
++ }
++ #endif
++
+  static int __init acer_wmi_input_setup(void)
+  {
+      acpi_status status;
+@@ -2911,7 +3019,7 @@ enum acer_wmi_predator_v4_oc {
+          input_set_capability(acer_wmi_input_dev, EV_SW, SW_TABLET_MODE);
+  
+      status = wmi_install_notify_handler(ACERWMID_EVENT_GUID,
+-                         acer_wmi_notify, NULL);
++                         acer_wmi_notify_handler, NULL);
+      if (ACPI_FAILURE(status)) {
+          err = -EIO;
+          goto err_free_dev;
+@@ -4180,6 +4288,8 @@ enum acer_wmi_predator_v4_oc {
+          four_zone_kb_state_save();
+      }
+  
++     acer_platform_profile_teardown();
++
+      acer_rfkill_exit();
+  }
+  
+@@ -4248,7 +4358,11 @@ enum acer_wmi_predator_v4_oc {
+          .pm = &acer_pm,
+      },
+      .probe = acer_platform_probe,
++ #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
+      .remove = acer_platform_remove,
++ #else
++     .remove_new = acer_platform_remove,
++ #endif
+      .shutdown = acer_platform_shutdown,
+  };
+  

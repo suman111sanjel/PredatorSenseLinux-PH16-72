@@ -1,0 +1,335 @@
+#!/usr/bin/env bash
+# predator - one-stop control for Acer Predator PH16-72 on Ubuntu 24.04
+#   fans + thermal profile  -> linuwu_sense (ACPI-WMI sysfs)
+#   keyboard RGB + patterns -> lamparray-kbd (HID LampArray over /dev/hidraw)
+# Requires: linuwu_sense loaded, membership of group 'linuwu_sense',
+#           lamparray-kbd installed (see lamparray-kbd/UBUNTU-24.04-GUIDE.md).
+set -uo pipefail
+
+PS=/sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/predator_sense
+HWMON_GLOB=/sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/hwmon/hwmon*
+PROFILE=/sys/firmware/acpi/platform_profile
+PROFILE_CHOICES=/sys/firmware/acpi/platform_profile_choices
+KB=${LAMPARRAY_BIN:-$HOME/.local/bin/lamparray-kbd}
+
+if [[ -t 1 ]]; then
+  B=$'\e[1m'; R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; C=$'\e[36m'; D=$'\e[2m'; N=$'\e[0m'
+else
+  B=; R=; G=; Y=; C=; D=; N=
+fi
+die()  { echo "${R}error:${N} $*" >&2; exit 1; }
+warn() { echo "${Y}warning:${N} $*" >&2; }
+ok()   { echo "${G}✓${N} $*"; }
+
+# --- helpers ---------------------------------------------------------------
+
+need_module() {
+  [[ -d $PS ]] || die "predator_sense sysfs not found - is linuwu_sense loaded? (lsmod | grep linuwu)"
+}
+# predator_sense files are group-writable by 'linuwu_sense'; fall back to sudo if not a member.
+wr() { # wr <file> <value>
+  local f=$1 v=$2
+  if [[ -w $f ]]; then printf '%s' "$v" > "$f"
+  else echo "$v" | sudo tee "$f" >/dev/null || die "write to $(basename "$f") failed"; fi
+}
+rd() { cat "$1" 2>/dev/null || echo "?"; }
+need_kb() {
+  [[ -x $KB ]] || die "lamparray-kbd not found at $KB - run lamparray-kbd/install.sh"
+  if ! "$KB" list 2>/dev/null | grep -q .; then
+    die "no LampArray keyboard visible. Run: sudo $KB install-udev   (then replug/reboot)"
+  fi
+}
+onoff() { case "${1,,}" in on|1|true|yes|enable|enabled) echo 1;; off|0|false|no|disable|disabled) echo 0;; *) die "expected on|off, got '$1'";; esac; }
+yn()    { [[ ${1:-} == 1 ]] && echo "${G}on${N}" || echo "${D}off${N}"; }
+
+# --- status ----------------------------------------------------------------
+
+cmd_status() {
+  need_module
+  local cur choices fan cpu gpu
+  cur=$(rd $PROFILE); choices=$(rd $PROFILE_CHOICES)
+  echo "${B}thermal${N}"
+  echo "  profile        ${C}${cur}${N}   ${D}(${choices})${N}"
+  fan=$(rd $PS/fan_speed); cpu=${fan%%,*}; gpu=${fan##*,}
+  if [[ $cpu == 0 && $gpu == 0 ]]; then
+    echo "  fan control    ${C}auto${N}"
+  else
+    echo "  fan control    ${C}manual${N}  cpu=${cpu}%  gpu=${gpu}%"
+  fi
+  local h; h=$(echo $HWMON_GLOB); h=${h%% *}
+  if [[ -d $h ]]; then
+    printf "  fan rpm        cpu=%s  gpu=%s\n" "$(rd $h/fan1_input)" "$(rd $h/fan2_input)"
+    local t1 t2 t3; t1=$(rd $h/temp1_input); t2=$(rd $h/temp2_input); t3=$(rd $h/temp3_input)
+    printf "  temps          %s°C  %s°C  %s°C\n" "$((t1/1000))" "$((t2/1000))" "$((t3/1000))"
+  fi
+  echo
+  echo "${B}system${N}"
+  echo "  backlight_timeout  $(yn "$(rd $PS/backlight_timeout)")   ${D}(30s keyboard idle blank)${N}"
+  echo "  battery_limiter    $(yn "$(rd $PS/battery_limiter)")   ${D}(charge to 80%)${N}"
+  echo "  lcd_override       $(yn "$(rd $PS/lcd_override)")   ${D}(reduce ghosting)${N}"
+  echo "  boot_anim_sound    $(yn "$(rd $PS/boot_animation_sound)")"
+  echo "  usb_charging       $(rd $PS/usb_charging)"
+  echo
+  echo "${B}keyboard${N}"
+  if [[ -x $KB ]] && "$KB" list 2>/dev/null | grep -q .; then
+    echo "  device         $("$KB" list 2>/dev/null | awk '{print $1, $2, $3, $4}')"
+    if [[ -f $HOME/.config/lamparray-kbd/state.json ]]; then
+      /usr/bin/python3 - <<'PY' 2>/dev/null || true
+import json, os
+s = json.load(open(os.path.expanduser("~/.config/lamparray-kbd/state.json")))
+for did, st in s.get("devices", {}).items():
+    m = st.get("mode", "?"); b = st.get("brightness", 100)
+    extra = ""
+    if "color"  in st: extra = "#%02x%02x%02x" % tuple(st["color"])
+    if "colors" in st: extra = " ".join("#%02x%02x%02x" % tuple(c) for c in st["colors"])
+    if m == "keys": extra = "base #%02x%02x%02x + %d keys" % (*st["base"], len(st.get("keys", {})))
+    print(f"  mode           {m} {extra}")
+    print(f"  brightness     {b}%")
+PY
+    fi
+  else
+    echo "  ${D}not available (see: predator kb help)${N}"
+  fi
+}
+
+# --- thermal ---------------------------------------------------------------
+
+cmd_mode() {
+  need_module
+  local choices; choices=$(rd $PROFILE_CHOICES)
+  if [[ $# -eq 0 ]]; then echo "current: $(rd $PROFILE)"; echo "choices: $choices"; return; fi
+  local want=$1
+  case "${want,}" in
+    silent|quiet)       want=quiet ;;
+    eco|low|lowpower)   want=low-power ;;
+    bal|balanced)       want=balanced ;;
+    perf|turbo|max)     want=performance ;;
+    balperf|bp)         want=balanced-performance ;;
+  esac
+  grep -qw -- "$want" <<<"$choices" || die "unknown profile '$1'. choices: $choices"
+  wr $PROFILE "$want"
+  ok "profile -> ${C}${want}${N}"
+}
+
+cmd_fan() {
+  need_module
+  [[ $# -ge 1 ]] || { echo "current: $(rd $PS/fan_speed)  (cpu,gpu; 0=auto)"; return; }
+  local cpu gpu
+  case "${1,,}" in
+    auto)   cpu=0;   gpu=0 ;;
+    max)    cpu=100; gpu=100 ;;
+    silent|min) cpu=1; gpu=1; warn "minimum fan speed - watch your temps" ;;
+    *)
+      if [[ $1 == *,* ]]; then cpu=${1%%,*}; gpu=${1##*,}
+      elif [[ $# -ge 2 ]]; then cpu=$1; gpu=$2
+      else cpu=$1; gpu=$1; fi ;;
+  esac
+  [[ $cpu =~ ^[0-9]+$ && $gpu =~ ^[0-9]+$ ]] || die "fan values must be integers 0-100"
+  (( cpu <= 100 && gpu <= 100 )) || die "fan values must be 0-100"
+  wr $PS/fan_speed "$cpu,$gpu"
+  if [[ $cpu == 0 && $gpu == 0 ]]; then ok "fans -> ${C}auto${N}"; else ok "fans -> cpu ${C}${cpu}%${N}  gpu ${C}${gpu}%${N}"; fi
+}
+
+cmd_toggle() { # cmd_toggle <attr> <label> [value]
+  need_module
+  local attr=$1 label=$2; shift 2
+  [[ $# -ge 1 ]] || { echo "$label: $(rd $PS/$attr)"; return; }
+  local v; v=$(onoff "$1"); wr $PS/$attr "$v"
+  ok "$label -> $([[ $v == 1 ]] && echo "${G}on${N}" || echo "${D}off${N}")"
+}
+
+# --- keyboard --------------------------------------------------------------
+
+kb_help() {
+  cat <<EOF
+${B}predator kb${N} <pattern> [args]        ${D}static patterns (persist across reboot/resume)${N}
+  solid COLOR                       one colour everywhere
+  gradient COLOR...                 left-to-right blend through 2+ colours
+  zones COLOR...                    N equal left-to-right blocks
+  keys BASE KEY=COLOR...            per-key over a base colour
+  rainbow                           full spectrum across the keyboard
+  off | auto                        all off | hand back to firmware effects
+  bright PCT                        set brightness 0-100 (sticky!)
+  list | info                       device / full lamp map
+
+${B}predator kb anim${N} <pattern> [opts]   ${D}animated (runs until Ctrl+C, not persistent)${N}
+  wave [speed] [sat]                hue wave travelling left-to-right
+  breathe COLOR [period]            fade in and out
+  cycle [speed]                     whole keyboard cycles the spectrum
+  ripple COLOR [speed]              pulse radiating from centre
+
+${B}colours${N}  rrggbb / rgb hex, or: red green blue white cyan magenta yellow
+         orange purple pink teal warmwhite coolwhite off black
+${B}keys${N}     a-z 0-9 f1-f24 esc space enter tab backspace lctrl lshift lalt
+         lmeta up down left right home end pageup pagedown ... or lamp number
+
+${D}examples${N}
+  predator kb solid 4287f5
+  predator kb gradient blue magenta
+  predator kb zones red green blue yellow
+  predator kb keys 202020 w=red a=red s=red d=red
+  predator kb bright 100
+  predator kb anim wave 1.5
+  predator kb anim breathe cyan 4
+EOF
+}
+
+kb_anim() {
+  need_kb
+  local pat=${1:-wave}; shift || true
+  ANIM_PAT="$pat" ANIM_A="${1:-}" ANIM_B="${2:-}" KB_BIN="$KB" \
+  /usr/bin/python3 - <<'PY'
+import colorsys, importlib.machinery, importlib.util, math, os, signal, sys, time
+
+loader = importlib.machinery.SourceFileLoader("la", os.environ["KB_BIN"])
+spec = importlib.util.spec_from_loader("la", loader)
+la = importlib.util.module_from_spec(spec); loader.exec_module(la)
+
+devs = la.discover()
+if not devs:
+    sys.exit("no LampArray device found")
+kb = la.LampArray(devs[0])
+lamps = kb.lamps()
+width = max(kb.w, 1)
+pat = os.environ["ANIM_PAT"]
+a, b = os.environ.get("ANIM_A", ""), os.environ.get("ANIM_B", "")
+
+def fnum(s, d):
+    try: return float(s)
+    except (TypeError, ValueError): return d
+
+# brightness from the saved state, so anim matches your static setting
+try:
+    import json
+    st = json.load(open(os.path.expanduser("~/.config/lamparray-kbd/state.json")))
+    bright = st["devices"][devs[0]["id"]].get("brightness", 100)
+except Exception:
+    bright = 100
+
+def scale(rgb): return tuple(min(255, round(c * bright / 100)) for c in rgb)
+def hsv(h, s=1.0, v=1.0): return scale(tuple(round(c*255) for c in colorsys.hsv_to_rgb(h % 1.0, s, v)))
+
+running = True
+def stop(*_):
+    global running; running = False
+signal.signal(signal.SIGINT, stop); signal.signal(signal.SIGTERM, stop)
+
+interval = max(kb.min_interval / 1e6, 0.033)   # device-declared floor, >= 30fps
+print(f"{pat}: {len(lamps)} lamps @ {1/interval:.0f}fps, brightness {bright}% - Ctrl+C to stop", file=sys.stderr)
+
+xs = {l["id"]: l["x"] / width for l in lamps}
+ys = {l["id"]: l["y"] / max(kb.h, 1) for l in lamps}
+t0 = time.time()
+try:
+    while running:
+        t = time.time() - t0
+        if pat == "wave":
+            sp, sat = fnum(a, 1.0), fnum(b, 1.0)
+            m = {i: hsv(t * sp * 0.2 - x, sat) for i, x in xs.items()}
+        elif pat == "cycle":
+            sp = fnum(a, 1.0)
+            c = hsv(t * sp * 0.15)
+            m = {i: c for i in xs}
+        elif pat == "breathe":
+            base = la.parse_color(a) if a else (0, 160, 255)
+            period = fnum(b, 4.0)
+            k = (math.sin(2 * math.pi * t / period) + 1) / 2
+            k = 0.08 + 0.92 * k
+            c = scale(tuple(round(v * k) for v in base))
+            m = {i: c for i in xs}
+        elif pat == "ripple":
+            base = la.parse_color(a) if a else (0, 200, 255)
+            sp = fnum(b, 1.0)
+            m = {}
+            for i in xs:
+                d = math.hypot(xs[i] - 0.5, (ys[i] - 0.5) * 0.3)
+                k = (math.sin(2 * math.pi * (t * sp * 0.5 - d * 2.5)) + 1) / 2
+                m[i] = scale(tuple(round(v * (0.05 + 0.95 * k)) for v in base))
+        else:
+            sys.exit(f"unknown animation '{pat}' (wave, cycle, breathe, ripple)")
+        kb.multi(m)
+        time.sleep(interval)
+except OSError as e:
+    sys.exit(f"device write failed: {e}")
+finally:
+    print("\nstopped. `predator kb restore` puts your saved colour back.", file=sys.stderr)
+PY
+}
+
+cmd_kb() {
+  [[ $# -ge 1 ]] || { kb_help; return; }
+  local sub=$1; shift
+  case "$sub" in
+    help|-h|--help) kb_help ;;
+    anim|animate)   kb_anim "$@" ;;
+    bright|brightness)
+      # NB: lamparray-kbd's own `restore` returns before saving state, so `-b N restore`
+      # is a no-op. Update the saved brightness directly, then re-apply.
+      need_kb; [[ $# -ge 1 ]] || die "usage: predator kb bright 0-100"
+      { [[ $1 =~ ^[0-9]+$ ]] && (( $1 <= 100 )); } || die "brightness must be 0-100"
+      /usr/bin/python3 - "$1" <<'BRIGHT_PY' || die "could not update brightness"
+import json, os, sys
+p = os.path.expanduser("~/.config/lamparray-kbd/state.json")
+b = int(sys.argv[1])
+try:
+    s = json.load(open(p))
+except (OSError, ValueError):
+    sys.exit("no saved lighting yet - set a colour first, e.g. predator kb solid blue")
+devs = s.get("devices")
+if not devs:
+    sys.exit("no saved lighting yet - set a colour first, e.g. predator kb solid blue")
+for d in devs.values():
+    d["brightness"] = b
+json.dump(s, open(p, "w"), indent=1)
+BRIGHT_PY
+      "$KB" restore && ok "brightness -> ${C}$1%${N}" ;;
+    rainbow)
+      need_kb; "$KB" gradient red orange yellow green cyan blue purple magenta \
+        && ok "keyboard -> ${C}rainbow${N}" ;;
+    restore) need_kb; "$KB" restore && ok "saved lighting re-applied" ;;
+    solid|gradient|zones|keys|off|auto|list|info)
+      need_kb; "$KB" "$sub" "$@" && [[ $sub != list && $sub != info ]] && ok "keyboard -> ${C}${sub}${N} $*" ;;
+    *) die "unknown kb command '$sub' (try: predator kb help)" ;;
+  esac
+}
+
+# --- main ------------------------------------------------------------------
+
+usage() {
+  cat <<EOF
+${B}predator${N} - Acer Predator PH16-72 control (Ubuntu 24.04)
+
+  ${B}status${N}                     everything at a glance
+  ${B}mode${N} [PROFILE]             thermal profile
+                             ${D}quiet | balanced | perf | eco | balperf${N}
+  ${B}fan${N} [auto|max|CPU,GPU]     fan speed, 0-100 each (0 = auto)
+  ${B}kb${N} <pattern> [args]        keyboard RGB - ${D}predator kb help${N}
+  ${B}timeout${N} [on|off]           30s keyboard idle blank
+  ${B}battery${N} [on|off]           80% charge limiter
+  ${B}lcd${N} [on|off]               LCD overdrive (less ghosting)
+  ${B}bootsound${N} [on|off]         boot animation + sound
+
+${D}examples${N}
+  predator status
+  predator mode perf && predator fan max
+  predator mode quiet && predator fan auto
+  predator kb gradient blue magenta
+  predator kb anim wave
+
+${D}note${N}  'mode' needs sudo (platform_profile is root-owned); fan and the
+      toggles do not, because you are in the 'linuwu_sense' group.
+EOF
+}
+
+case "${1:-status}" in
+  status|st)        shift || true; cmd_status "$@" ;;
+  mode|profile)     shift || true; cmd_mode "$@" ;;
+  fan|fans)         shift || true; cmd_fan "$@" ;;
+  kb|keyboard|rgb)  shift || true; cmd_kb "$@" ;;
+  timeout)          shift || true; cmd_toggle backlight_timeout "backlight_timeout" "$@" ;;
+  battery)          shift || true; cmd_toggle battery_limiter "battery_limiter" "$@" ;;
+  lcd)              shift || true; cmd_toggle lcd_override "lcd_override" "$@" ;;
+  bootsound)        shift || true; cmd_toggle boot_animation_sound "boot_animation_sound" "$@" ;;
+  help|-h|--help)   usage ;;
+  *) die "unknown command '${1}' (try: predator help)" ;;
+esac
