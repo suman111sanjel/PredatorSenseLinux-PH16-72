@@ -23,6 +23,8 @@ Follow §1 → §6 in order. Allow about 20 minutes, including one reboot.
 > See [Keep this reproducible](#keep-this-reproducible) for the full picture, including a
 > `.gitignore` you want before pushing.
 
+
+
 ---
 
 ## 0. What you are installing, and why it takes four pieces
