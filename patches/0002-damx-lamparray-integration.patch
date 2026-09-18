@@ -721,7 +721,7 @@ index 0000000..56497e5
 +source is unmodified, and the change that makes its panels appear is on the daemon side and is
 +covered by the tests above, but the end-to-end click-through has not been exercised.
 diff --git a/scripts/local-setup.sh b/scripts/local-setup.sh
-index 09c4506..b6eac41 100755
+index 09c4506..d8eb2c8 100755
 --- a/scripts/local-setup.sh
 +++ b/scripts/local-setup.sh
 @@ -17,6 +17,11 @@ MODULE_SIGNING_KEY="${MODULE_SIGNING_DIR}/DAMX-MOK.priv"
@@ -736,7 +736,28 @@ index 09c4506..b6eac41 100755
  # Legacy paths for cleanup (uppercase naming convention)
  LEGACY_INSTALL_DIR="/opt/DAMX"
  LEGACY_DAEMON_SERVICE_NAME="DAMX-Daemon.service"
-@@ -170,6 +175,13 @@ comprehensive_cleanup() {
+@@ -157,6 +162,20 @@ comprehensive_cleanup() {
+   rm -f ${DESKTOP_FILE_DIR}/damx.desktop
+   rm -f ${ICON_DIR}/damx.png
+ 
++  # Remove per-user launcher copies, but only ones pointing at this install -
++  # never touch an entry the user wrote for something else.
++  for user_home in /home/*; do
++    entry="$user_home/.local/share/applications/damx.desktop"
++    if [ -f "$entry" ] && grep -q "^Exec=${INSTALL_DIR}/gui/DivAcerManagerMax" "$entry"; then
++      rm -f "$entry"
++      rm -f "$user_home/.local/share/icons/hicolor/256x256/apps/damx.png"
++    fi
++  done
++  command -v update-desktop-database &> /dev/null && \
++    update-desktop-database ${DESKTOP_FILE_DIR} &> /dev/null || true
++  command -v gtk-update-icon-cache &> /dev/null && \
++    gtk-update-icon-cache -f -t /usr/share/icons/hicolor &> /dev/null || true
++
+   # Uninstall drivers if Linuwu-Sense folder exists
+   if [ -d "Linuwu-Sense" ]; then
+     echo "Uninstalling drivers..."
+@@ -170,6 +189,13 @@ comprehensive_cleanup() {
    # Remove nitro key configuration
    rm -rf /etc/damx
  
@@ -750,7 +771,7 @@ index 09c4506..b6eac41 100755
    # Final systemd daemon reload
    systemctl daemon-reload
  
-@@ -506,6 +518,57 @@ install_drivers() {
+@@ -506,6 +532,57 @@ install_drivers() {
    return 0
  }
  
@@ -808,7 +829,7 @@ index 09c4506..b6eac41 100755
  install_daemon() {
    echo -e "${YELLOW}Installing DAMX-Daemon...${NC}"
  
-@@ -523,6 +586,13 @@ install_daemon() {
+@@ -523,6 +600,13 @@ install_daemon() {
    cp -f DAMX-Daemon/DAMX-Daemon ${INSTALL_DIR}/daemon/
    chmod +x ${INSTALL_DIR}/daemon/DAMX-Daemon
  
@@ -822,7 +843,81 @@ index 09c4506..b6eac41 100755
    # Create systemd service file with improved configuration
    cat > ${SYSTEMD_DIR}/${DAEMON_SERVICE_NAME} << EOL
  [Unit]
-@@ -814,6 +884,8 @@ perform_install() {
+@@ -580,18 +664,68 @@ install_gui() {
+   # Copy icon
+   cp -f DAMX-GUI/icon.png ${ICON_DIR}/damx.png
+ 
+-  # Create desktop entry
++  # Create desktop entry.
++  # Notes on the fields that are easy to get wrong:
++  #  - Categories lists exactly ONE main category (Settings). Listing two, e.g.
++  #    "Utility;System;", makes the app appear twice in the GNOME menu.
++  #    HardwareSettings is an additional category and requires Settings.
++  #  - StartupWMClass lets the shell match the window to this entry, so the
++  #    running app groups under its own icon instead of a generic placeholder.
++  #  - Keywords make the app findable by what it does, not just its name.
+   cat > ${DESKTOP_FILE_DIR}/damx.desktop << EOL
+ [Desktop Entry]
++Type=Application
++Version=1.0
+ Name=DAMX
+-Comment=Div Acer Manager Max
++GenericName=Acer Laptop Control
++Comment=Fan speed, thermal profile, battery and keyboard RGB for Acer laptops
+ Exec=${INSTALL_DIR}/gui/DivAcerManagerMax
+ Icon=damx
+ Terminal=false
+-Type=Application
+-Categories=Utility;System;
+-Keywords=acer;laptop;system;
++Categories=Settings;HardwareSettings;
++Keywords=acer;predator;nitro;laptop;fan;thermal;rgb;keyboard;backlight;battery;
++StartupNotify=true
++StartupWMClass=DivAcerManagerMax
+ EOL
++  chmod 644 ${DESKTOP_FILE_DIR}/damx.desktop
++
++  # Refresh the desktop and icon caches so the launcher appears immediately
++  # instead of after the next login.
++  if command -v update-desktop-database &> /dev/null; then
++    update-desktop-database ${DESKTOP_FILE_DIR} &> /dev/null || true
++  fi
++  if command -v gtk-update-icon-cache &> /dev/null; then
++    gtk-update-icon-cache -f -t /usr/share/icons/hicolor &> /dev/null || true
++  fi
++
++  # ~/.local/share/applications takes precedence over /usr/share, so a per-user
++  # entry shadows the one installed above. Only warn - never delete a file the
++  # user put there deliberately - and only when it actually points somewhere else.
++  local desktop_user user_home user_entry user_exec
++  desktop_user=$(detect_desktop_user)
++  if [ -n "$desktop_user" ]; then
++    user_home=$(getent passwd "$desktop_user" | cut -d: -f6)
++    user_entry="${user_home}/.local/share/applications/damx.desktop"
++    if [ -n "$user_home" ] && [ -f "$user_entry" ]; then
++      user_exec=$(grep -m1 '^Exec=' "$user_entry" | cut -d= -f2-)
++      if [ "$user_exec" != "${INSTALL_DIR}/gui/DivAcerManagerMax" ]; then
++        echo -e "${YELLOW}Note: ${desktop_user} has a personal launcher that overrides this one:${NC}"
++        echo -e "${YELLOW}  ${user_entry}${NC}"
++        echo -e "${YELLOW}  it runs: ${user_exec:-<no Exec line>}${NC}"
++        echo -e "${YELLOW}  Delete it if DAMX fails to start from the application list.${NC}"
++      fi
++    fi
++  fi
++
++  # Validate the entry if the tool is available - a malformed file silently
++  # fails to appear in the application list.
++  if command -v desktop-file-validate &> /dev/null; then
++    if desktop-file-validate ${DESKTOP_FILE_DIR}/damx.desktop; then
++      echo -e "${GREEN}Desktop entry validated.${NC}"
++    else
++      echo -e "${YELLOW}Desktop entry validation reported issues (see above).${NC}"
++    fi
++  fi
+ 
+   # Create command shortcut
+   cat > ${BIN_DIR}/DAMX << EOL
+@@ -814,6 +948,8 @@ perform_install() {
      DRIVER_RESULT=0
    fi
  
