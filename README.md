@@ -26,6 +26,155 @@ To Uninstall:
 ```bash
 make uninstall
 ```
+
+---
+
+### 🐧 Ubuntu 24.04 LTS — detailed walkthrough
+
+#### Step 0: Check your kernel version first
+
+```bash
+uname -r
+```
+
+This matters more on Ubuntu than on Arch. Ubuntu 24.04 ships the **6.8 GA kernel**, which is *older* than the 6.12–6.14 range this module targets. Building against 6.8 unmodified fails immediately with:
+
+```
+fatal error: linux/unaligned.h: No such file or directory
+```
+
+You have two ways forward:
+
+| Option | Kernel | Notes |
+| --- | --- | --- |
+| **A — Upgrade the kernel** (recommended) | 6.14 via HWE | Matches what upstream tests against. Requires a reboot. |
+| **B — Stay on 6.8 GA** | 6.8 | Only works on a tree carrying 6.8 compatibility guards. Without them the build fails — see [Troubleshooting](#troubleshooting). |
+
+#### Step 1: Install build dependencies
+
+```bash
+sudo apt update
+sudo apt install -y build-essential git linux-headers-$(uname -r)
+```
+
+`build-essential` provides `gcc` and `make`; the headers package must match your **running** kernel exactly, which is why `$(uname -r)` is used rather than a hardcoded version.
+
+#### Step 2 (Option A only): Move to the HWE kernel
+
+```bash
+sudo apt install -y linux-generic-hwe-24.04
+sudo reboot
+```
+
+After rebooting, confirm you are on the newer kernel and install its headers:
+
+```bash
+uname -r
+sudo apt install -y linux-headers-$(uname -r)
+```
+
+#### Step 3: Check Secure Boot
+
+```bash
+mokutil --sb-state
+```
+
+- **`SecureBoot disabled`** — nothing to do, continue to Step 4.
+- **`SecureBoot enabled`** — the kernel will refuse to load an unsigned module, failing with `Key was rejected by service`. Either generate and enroll a MOK key by following [`module_signing_readme`](module_signing_readme), or disable Secure Boot in your BIOS/UEFI settings.
+
+The `Makefile` signs the module automatically if it finds `~/module-signing/MOK.priv` and `MOK.der`, and prints `MOK keys not found ... Skipping module signing` when it does not. That message is harmless if Secure Boot is off.
+
+#### Step 4: Clone, build, and install
+
+```bash
+git clone https://github.com/0x7375646F/Linuwu-Sense.git
+cd Linuwu-Sense
+make install
+```
+
+`make install` needs `sudo` internally and changes your system in several persistent ways, so it is worth knowing what it does:
+
+- Unloads the in-tree `acer_wmi` module and **permanently blacklists** it via `/etc/modprobe.d/blacklist-acer_wmi.conf` (the two modules claim the same WMI GUIDs and cannot coexist)
+- Installs `linuwu_sense.ko` into `/lib/modules/$(uname -r)/kernel/drivers/platform/x86`
+- Enables load-at-boot through `/etc/modules-load.d/linuwu_sense.conf`
+- Installs and enables `linuwu_sense.service`, which restores your fan and thermal settings after a reboot
+- Creates a `linuwu_sense` group, adds your user to it, and writes `/etc/tmpfiles.d/` rules so the sysfs controls are group-writable without `sudo`
+
+All of it is reversible with `make uninstall`.
+
+#### Step 5: Apply your new group membership
+
+Group changes do not affect your current login session. Either log out and back in, or start a subshell:
+
+```bash
+newgrp linuwu_sense
+```
+
+Until you do this, writing to the sysfs files still requires `sudo`.
+
+#### Step 6: Verify the install
+
+```bash
+lsmod | grep linuwu_sense
+ls /sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/
+cat /sys/firmware/acpi/platform_profile_choices
+systemctl status linuwu_sense.service
+```
+
+A healthy install shows a **`predator_sense`** directory (Predator models) or **`nitro_sense`** (Nitro models), plus `hwmon` for fan and temperature readings, and a `four_zoned_kb` directory on four-zone RGB keyboards. `platform_profile_choices` should list your supported thermal profiles, for example:
+
+```
+low-power quiet balanced balanced-performance performance
+```
+
+Check `sudo dmesg | grep linuwu_sense` for `Platform profile registered successfully` to confirm thermal control came up.
+
+#### ⚠️ Rebuild after every kernel update
+
+This module does **not** use DKMS, and Ubuntu ships kernel updates regularly. After any update that changes your kernel, the module will not load until you rebuild it against the new version:
+
+```bash
+sudo apt install -y linux-headers-$(uname -r)
+cd /path/to/Linuwu-Sense
+make install
+```
+
+Consider holding kernel upgrades if you would rather not repeat this, or add the rebuild to your post-upgrade routine.
+
+#### Troubleshooting
+
+**`fatal error: linux/unaligned.h: No such file or directory`**
+Your kernel is older than 6.12. This header was renamed from `asm/unaligned.h` in 6.12. Follow Option A in Step 0, or use a tree with 6.8 compatibility guards.
+
+**Errors mentioning `platform_profile_ops`, `devm_platform_profile_register`, `BACKLIGHT_POWER_ON`, `wmi_install_notify_handler`, or `.remove`**
+Same root cause as above — these APIs all changed between 6.8 and 6.14. Upgrading the kernel resolves all of them at once.
+
+**The module loads, but no `predator_sense` or `nitro_sense` directory appears**
+The module loaded but your laptop is not in the driver's DMI quirk table, so no features were enabled. Check what your machine reports:
+
+```bash
+cat /sys/class/dmi/id/product_name
+```
+
+If that model is absent from `acer_quirks[]` in [`src/linuwu_sense.c`](src/linuwu_sense.c), it needs a new entry. Please open an issue or PR including your `product_name` and laptop model — this is the most common reason the module appears to install successfully yet does nothing.
+
+**`modprobe: ERROR: could not insert 'linuwu_sense': Key was rejected by service`**
+Secure Boot is enabled and the module is unsigned. See Step 3.
+
+**`make: *** /lib/modules/6.8.0-XX-generic/build: No such file or directory`**
+The headers for your running kernel are missing. Re-run Step 1. If you just upgraded your kernel but have not rebooted, either reboot first or the headers will not match `uname -r`.
+
+**Thermal profile or Turbo key does nothing**
+Confirm `acer_wmi` is actually blacklisted and not loaded, since it conflicts with this module:
+
+```bash
+lsmod | grep acer_wmi
+```
+
+That should return nothing. If it is loaded, run `sudo rmmod acer_wmi` and verify `/etc/modprobe.d/blacklist-acer_wmi.conf` exists.
+
+---
+
 > **⚠️ Warning!**
 > ## Use at your own risk! This driver is independently developed through reverse engineering the official PredatorSense app, without any involvement from Acer. It interacts with low-level WMI methods, which may not be tested across all models.
 

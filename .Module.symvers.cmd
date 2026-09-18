@@ -1,0 +1,1 @@
+savedcmd_/home/suman/SharedPath/Software/Linuwu-Sense/Module.symvers :=  scripts/mod/modpost -M -m -a      -o /home/suman/SharedPath/Software/Linuwu-Sense/Module.symvers -T /home/suman/SharedPath/Software/Linuwu-Sense/modules.order -i Module.symvers -e 
