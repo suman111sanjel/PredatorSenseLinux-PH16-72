@@ -3,6 +3,35 @@ The code base is still in its early stages, as I’ve just started working on de
 
 Inspired by [acer-predator-turbo](https://github.com/JafarAkhondali/acer-predator-turbo-and-rgb-keyboard-linux-module), which has a similar goal, this project was born out of my own challenges. I faced issues detecting the Turbo key and ended up using [acer_wmi](https://github.com/torvalds/linux/blob/master/drivers/platform/x86/acer-wmi.c), but it lacked key features like RGB , custom fan support, battery limiter, and more. As a result, I decided to implement these missing features in my own project.
 
+---
+
+> ## 🖥️ Acer Predator PH16-72 on Ubuntu 24.04 — start here
+>
+> **➡️ [SETUP.md](SETUP.md) — complete, tested, fresh-install guide.**
+>
+> The generic instructions below target Arch and kernels 6.12–6.14. On a PH16-72 running
+> Ubuntu 24.04 (kernel 6.8) they are not enough on their own, because:
+>
+> - upstream tracks kernel **6.14+**, so the build fails on 6.8 without the compatibility
+>   patch in [`patches/0001-ph16-72-kernel-6.8-support.patch`](patches/0001-ph16-72-kernel-6.8-support.patch);
+> - upstream has **no `Predator PH16-72` DMI entry**, so even a successful build leaves the
+>   laptop detected as `UNKNOWN` and nothing works;
+> - the PH16-72 keyboard is **per-key RGB over USB HID**, not a four-zone EC function, so
+>   `four_zoned_kb` never appears and this module cannot drive the keyboard at all.
+>
+> [SETUP.md](SETUP.md) covers all three, plus the `predator` CLI and the optional DAMX GUI.
+>
+> | Guide | Covers |
+> |---|---|
+> | **[SETUP.md](SETUP.md)** | **fresh install, start to finish — read this first** |
+> | [PREDATOR-SCRIPT.md](PREDATOR-SCRIPT.md) | the `predator` CLI: fans, thermal mode, keyboard colour and patterns |
+> | [docs/KEYBOARD-GUIDE.md](docs/KEYBOARD-GUIDE.md) | per-key RGB deep-dive, LampArray protocol, troubleshooting |
+> | [docs/DAMX-INSTALL.md](docs/DAMX-INSTALL.md) | the DAMX graphical front-end |
+>
+> Verified on Ubuntu 24.04.5 LTS, kernel 6.8.0-136-generic, Secure Boot off.
+
+---
+
 ## 🚀 Installation
 To begin, identify your current kernel version:
 ```bash
