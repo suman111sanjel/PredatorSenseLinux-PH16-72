@@ -1,0 +1,21 @@
+# Kernel module build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+.*.cmd
+Module.symvers
+modules.order
+.tmp_versions/
+
+# Third-party checkouts - reproduced via patches/ instead of vendoring
+/lamparray-kbd/
+/Div-Acer-Manager-Max/
+
+# Locally staged GUI install tree (~100 MB, rebuilt from the DAMX release)
+/DAMX-Install/
+
+# Python
+__pycache__/
+*.py[cod]

@@ -231,9 +231,15 @@ cd ~/Linuwu-Sense
 git clone https://github.com/PXDiv/Div-Acer-Manager-Max.git
 ```
 
-Apply the LampArray integration — see [`Div-Acer-Manager-Max/LAMPARRAY-INTEGRATION.md`](Div-Acer-Manager-Max/LAMPARRAY-INTEGRATION.md)
-for what it changes and why. Then stage and install as described in
-[`DAMX-Install/INSTALL.md`](DAMX-Install/INSTALL.md):
+Apply the LampArray integration, then stage and install:
+
+```bash
+cd Div-Acer-Manager-Max
+git apply ../patches/0002-damx-lamparray-integration.patch
+```
+
+That patch also adds `LAMPARRAY-INTEGRATION.md` inside the DAMX clone, explaining the design.
+Staging instructions are in [`docs/DAMX-INSTALL.md`](docs/DAMX-INSTALL.md):
 
 ```bash
 cd ~/Linuwu-Sense/DAMX-Install
@@ -339,9 +345,9 @@ modules.order
 | `patches/0001-ph16-72-kernel-6.8-support.patch` | the driver patch, standalone |
 | `predator` | the unified CLI |
 | `PREDATOR-SCRIPT.md` | CLI reference |
-| `lamparray-kbd/UBUNTU-24.04-GUIDE.md` | keyboard deep-dive, protocol, troubleshooting |
-| `Div-Acer-Manager-Max/LAMPARRAY-INTEGRATION.md` | GUI integration design |
-| `DAMX-Install/INSTALL.md` | staged GUI install |
+| `docs/KEYBOARD-GUIDE.md` | keyboard deep-dive, protocol, troubleshooting |
+| `patches/0002-damx-lamparray-integration.patch` | the DAMX GUI integration, standalone |
+| `docs/DAMX-INSTALL.md` | staged GUI install |
 
 Verified on: Ubuntu 24.04.5 LTS, kernel 6.8.0-136-generic, Secure Boot off, Predator PH16-72,
 keyboard `05af:666a` (103 lamps).

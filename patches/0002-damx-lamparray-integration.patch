@@ -1,0 +1,833 @@
+diff --git a/DAMM-Daemon/DAMX-Daemon.py b/DAMM-Daemon/DAMX-Daemon.py
+index 122d486..53b0732 100644
+--- a/DAMM-Daemon/DAMX-Daemon.py
++++ b/DAMM-Daemon/DAMX-Daemon.py
+@@ -22,6 +22,13 @@ from pathlib import Path
+ from enum import Enum
+ from PowerSourceDetection import PowerSourceDetector 
+ from typing import Dict, List, Tuple, Set
++
++# Per-key RGB backend for keyboards that speak HID LampArray instead of exposing a
++# usable linuwu_sense four_zoned_kb interface (e.g. Predator PH16-72, 05af:666a).
++try:
++    from LampArrayBackend import LampArrayController
++except ImportError:  # keep the daemon usable if the backend file is missing
++    LampArrayController = None
+ # from KeyboardMonitor import KeyboardMonitor
+ 
+ # Constants
+@@ -133,6 +140,7 @@ class DAMXManager:
+         self.base_path = self._get_base_path()
+         self.has_four_zone_kb = self._check_four_zone_kb()
+         self.enek5130_hid_device = self._find_enek5130_hid_device()
++        self.lamparray = LampArrayController() if LampArrayController else None
+         self.current_modprobe_param = self._detect_current_modprobe_param()
+ 
+         # Available features set
+@@ -142,6 +150,11 @@ class DAMXManager:
+         log.info(f"Base path: {self.base_path}")
+         log.info(f"Four-zone keyboard: {'Yes' if self.has_four_zone_kb else 'No'}")
+         log.info(f"ENEK5130 HID RGB device: {self.enek5130_hid_device or 'Not found'}")
++        if self.lamparray and self.lamparray.available:
++            log.info(f"LampArray per-key RGB: {self.lamparray.device_id} "
++                     f"({self.lamparray.lamp_count} lamps) on {self.lamparray.device_path}")
++        else:
++            log.info("LampArray per-key RGB: Not found")
+         log.info(f"Available features: {', '.join(self.available_features)}")
+ 
+         # Check if paths exist
+@@ -515,6 +528,15 @@ class DAMXManager:
+         if self.enek5130_hid_device:
+             available.add("enek5130_hid_rgb")
+ 
++        # A HID LampArray keyboard satisfies the same zone-based contract the GUI
++        # already speaks, so advertise those feature names even though
++        # four_zoned_kb does not exist on this hardware. This is what makes the
++        # existing keyboard panels appear with no GUI changes.
++        if self.lamparray and self.lamparray.available:
++            available.add("per_zone_mode")
++            available.add("four_zone_mode")
++            available.add("lamparray_rgb")
++
+         return available
+ 
+     def _check_four_zone_kb(self) -> bool:
+@@ -860,6 +882,9 @@ class DAMXManager:
+         if "per_zone_mode" not in self.available_features:
+             return ""
+ 
++        if self.lamparray and self.lamparray.available:
++            return self.lamparray.get_per_zone_mode()
++
+         return self._read_file("/sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/four_zoned_kb/per_zone_mode")
+ 
+     def set_per_zone_mode(self, zone1: str, zone2: str, zone3: str, zone4: str, brightness: int) -> bool:
+@@ -891,6 +916,11 @@ class DAMXManager:
+ 
+         value = f"{zone1},{zone2},{zone3},{zone4},{brightness}\n"
+ 
++        if self.lamparray and self.lamparray.available:
++            if self.lamparray.set_per_zone_mode([zone1, zone2, zone3, zone4], brightness):
++                return True
++            log.warning("LampArray per-zone write failed, falling through to sysfs")
++
+         if self.enek5130_hid_device:
+             if self._set_enek5130_per_zone_color([zone1, zone2, zone3, zone4], brightness):
+                 return True
+@@ -905,6 +935,9 @@ class DAMXManager:
+         if "four_zone_mode" not in self.available_features:
+             return ""
+ 
++        if self.lamparray and self.lamparray.available:
++            return self.lamparray.get_four_zone_mode()
++
+         return self._read_file("/sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/four_zoned_kb/four_zone_mode")
+ 
+     def set_four_zone_mode(self, mode: int, speed: int, brightness: int,
+@@ -944,6 +977,12 @@ class DAMXManager:
+ 
+         value = f"{mode},{speed},{brightness},{direction},{red},{green},{blue}\n"
+ 
++        if self.lamparray and self.lamparray.available:
++            if self.lamparray.set_four_zone_mode(mode, speed, brightness,
++                                                 direction, red, green, blue):
++                return True
++            log.warning("LampArray four-zone write failed, falling through to sysfs")
++
+         if self.enek5130_hid_device:
+             if mode == 0:
+                 if self._set_enek5130_static_color(red, green, blue, brightness):
+@@ -960,7 +999,18 @@ class DAMXManager:
+         """Get all DAMX-Daemon settings as a dictionary"""
+         settings = {
+             "laptop_type": self.laptop_type.name,
+-            "has_four_zone_kb": self.has_four_zone_kb,
++            # Capability, not implementation: true when *any* backend can drive
++            # zoned keyboard colour. The GUI gates its keyboard panels on this, and
++            # a LampArray keyboard satisfies the same contract even though the
++            # linuwu_sense four_zoned_kb sysfs group does not exist on such models.
++            # `has_four_zone_kb_sysfs` preserves the literal hardware fact.
++            "has_four_zone_kb": bool(self.has_four_zone_kb or
++                                     (self.lamparray and self.lamparray.available)),
++            "has_four_zone_kb_sysfs": self.has_four_zone_kb,
++            "keyboard_backend": ("lamparray" if (self.lamparray and self.lamparray.available)
++                                 else "enek5130" if self.enek5130_hid_device
++                                 else "linuwu_sense" if self.has_four_zone_kb else "none"),
++            "lamparray": self.lamparray.describe() if self.lamparray else {"available": False},
+             "available_features": list(self.available_features),
+             "version": VERSION,
+             "driver_version": self.get_driver_version(),
+@@ -1650,7 +1700,15 @@ class DAMXDaemon:
+     
+         if self.power_monitor:
+             self.power_monitor.stop_monitoring()
+-    
++
++        # Stop any running LampArray effect thread
++        if self.manager is not None and getattr(self.manager, "lamparray", None):
++            try:
++                self.manager.lamparray.shutdown()
++                log.info("LampArray effect thread stopped")
++            except Exception as e:
++                log.warning(f"LampArray shutdown failed: {e}")
++
+         # Remove PID file
+         try:
+             if os.path.exists(PID_FILE):
+diff --git a/DAMM-Daemon/DAMX-Daemon.spec b/DAMM-Daemon/DAMX-Daemon.spec
+index 107e124..0e531e9 100644
+--- a/DAMM-Daemon/DAMX-Daemon.spec
++++ b/DAMM-Daemon/DAMX-Daemon.spec
+@@ -6,7 +6,7 @@ a = Analysis(
+     pathex=[],
+     binaries=[],
+     datas=[],
+-    hiddenimports=[],
++    hiddenimports=['LampArrayBackend'],
+     hookspath=[],
+     hooksconfig={},
+     runtime_hooks=[],
+diff --git a/DAMM-Daemon/LampArrayBackend.py b/DAMM-Daemon/LampArrayBackend.py
+new file mode 100644
+index 0000000..dc83c7b
+--- /dev/null
++++ b/DAMM-Daemon/LampArrayBackend.py
+@@ -0,0 +1,389 @@
++#!/usr/bin/env python3
++"""
++LampArrayBackend - per-key RGB backend for DAMX-Daemon.
++
++Drives keyboards that implement the standard HID LampArray protocol (usage page 0x59,
++HUT 1.5 §25 - "Windows Dynamic Lighting"), on laptops where linuwu_sense exposes no
++usable four_zoned_kb sysfs interface.
++
++Why this exists
++---------------
++On the Acer Predator PH16-72 (and siblings that share quirk_acer_predator_v4) the
++keyboard is per-key RGB on a separate USB device (05af:666a), not a four-zone EC
++function. linuwu_sense therefore never creates four_zoned_kb, and the GUI's keyboard
++panels stay hidden with nothing to talk to.
++
++Design
++------
++This follows the precedent already set by the ENEK5130 HID backend in DAMX-Daemon:
++an alternative transport that satisfies the *existing* zone-based contract rather than
++introducing a new protocol. The daemon and GUI keep speaking per_zone_mode /
++four_zone_mode; this module maps those onto real per-key lamp positions.
++
++  per_zone_mode(z1..z4, brightness) -> keyboard split into 4 left-to-right bands
++  four_zone_mode(mode=0, ...)       -> solid colour
++  four_zone_mode(mode=1..7, ...)    -> rendered by a background animation thread,
++                                       because LampArray is a static per-lamp protocol
++                                       with no firmware effect engine
++
++The actual HID transport is reused from `lamparray-kbd` (MIT), imported as a module so
++there is exactly one implementation of the protocol on the system.
++"""
++
++import colorsys
++import glob
++import importlib.machinery
++import importlib.util
++import json
++import logging
++import math
++import os
++import random
++import threading
++import time
++from typing import Dict, List, Optional, Tuple
++
++log = logging.getLogger("DAMXDaemon")
++
++STATE_PATH = "/etc/DAMX_Daemon/lamparray_state.json"
++
++# Where to look for the lamparray-kbd implementation, most-preferred first.
++# Override with LAMPARRAY_KBD_PATH=/path/to/lamparray-kbd
++_SEARCH_PATHS = [
++    "/usr/local/lib/damx/lamparray-kbd",
++    "/usr/local/bin/lamparray-kbd",
++    "/usr/bin/lamparray-kbd",
++    "/opt/lamparray-kbd/lamparray-kbd",
++]
++_SEARCH_GLOBS = [
++    "/home/*/.local/bin/lamparray-kbd",
++    "/home/*/*/lamparray-kbd/lamparray-kbd",
++    "/home/*/*/*/lamparray-kbd/lamparray-kbd",
++    "/home/*/*/*/*/lamparray-kbd/lamparray-kbd",
++]
++
++# four_zone_mode effect ids, as documented by Linuwu-Sense
++MODE_STATIC, MODE_BREATH, MODE_NEON, MODE_WAVE = 0, 1, 2, 3
++MODE_SHIFT, MODE_ZOOM, MODE_METEOR, MODE_TWINKLE = 4, 5, 6, 7
++ANIMATED_MODES = {MODE_BREATH, MODE_NEON, MODE_WAVE, MODE_SHIFT,
++                  MODE_ZOOM, MODE_METEOR, MODE_TWINKLE}
++
++
++def _find_lamparray_module() -> str:
++    """Locate the lamparray-kbd script. Returns '' if not found."""
++    env = os.environ.get("LAMPARRAY_KBD_PATH", "")
++    if env and os.path.isfile(env):
++        return env
++    for p in _SEARCH_PATHS:
++        if os.path.isfile(p):
++            return p
++    for pattern in _SEARCH_GLOBS:
++        for p in sorted(glob.glob(pattern)):
++            if os.path.isfile(p):
++                return p
++    return ""
++
++
++def _load_lamparray():
++    """Import lamparray-kbd as a module (it has no .py extension)."""
++    path = _find_lamparray_module()
++    if not path:
++        return None, ""
++    try:
++        loader = importlib.machinery.SourceFileLoader("_lamparray", path)
++        spec = importlib.util.spec_from_loader("_lamparray", loader)
++        mod = importlib.util.module_from_spec(spec)
++        loader.exec_module(mod)
++        return mod, path
++    except Exception as e:  # noqa: BLE001 - a broken helper must not kill the daemon
++        log.error(f"LampArray: failed to import {path}: {e}")
++        return None, ""
++
++
++def _hex_to_rgb(value: str) -> Tuple[int, int, int]:
++    v = value.strip().lstrip("#")
++    if len(v) == 3:
++        v = "".join(c * 2 for c in v)
++    return int(v[0:2], 16), int(v[2:4], 16), int(v[4:6], 16)
++
++
++def _rgb_to_hex(rgb) -> str:
++    return "%02x%02x%02x" % tuple(max(0, min(255, int(c))) for c in rgb)
++
++
++class LampArrayController:
++    """Per-key RGB control satisfying DAMX's zone-based contract.
++
++    Thread-safety: every public method takes self._lock. The animation thread holds
++    no lock while sleeping, and checks self._stop between frames, so a new command
++    preempts a running effect within one frame (<=33 ms).
++    """
++
++    def __init__(self):
++        self._lock = threading.RLock()
++        self._stop = threading.Event()
++        self._thread: Optional[threading.Thread] = None
++        self._kb = None
++        self._lamps: List[Dict] = []
++        self._module, self._module_path = _load_lamparray()
++        self.device_id = ""
++        self.device_path = ""
++        self.lamp_count = 0
++        # Last committed settings, kept in the exact string shapes the GUI parses.
++        self.state = self._load_state()
++        self._probe()
++
++    # --- discovery ---------------------------------------------------------
++
++    def _probe(self) -> None:
++        """Find and open a LampArray device. Safe to call repeatedly."""
++        if self._module is None:
++            return
++        try:
++            devs = self._module.discover()
++        except Exception as e:  # noqa: BLE001
++            log.error(f"LampArray: discovery failed: {e}")
++            return
++        if not devs:
++            return
++        dev = devs[0]
++        try:
++            self._kb = self._module.LampArray(dev)
++            self._lamps = self._kb.lamps()
++        except Exception as e:  # noqa: BLE001
++            log.error(f"LampArray: cannot open {dev.get('path')}: {e}")
++            self._kb = None
++            return
++        self.device_id = dev["id"]
++        self.device_path = dev["path"]
++        self.lamp_count = self._kb.count
++        log.info(f"LampArray: {self.device_id} on {self.device_path}, "
++                 f"{self.lamp_count} lamps, via {self._module_path}")
++
++    @property
++    def available(self) -> bool:
++        return self._kb is not None
++
++    def describe(self) -> Dict:
++        return {
++            "available": self.available,
++            "device_id": self.device_id,
++            "device_path": self.device_path,
++            "lamp_count": self.lamp_count,
++            "implementation": self._module_path,
++        }
++
++    # --- state persistence -------------------------------------------------
++
++    def _load_state(self) -> Dict:
++        try:
++            with open(STATE_PATH, "r", encoding="utf-8") as f:
++                return json.load(f)
++        except (OSError, ValueError):
++            return {"per_zone_mode": "", "four_zone_mode": ""}
++
++    def _save_state(self) -> None:
++        try:
++            os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
++            with open(STATE_PATH, "w", encoding="utf-8") as f:
++                json.dump(self.state, f, indent=1)
++        except OSError as e:
++            log.warning(f"LampArray: could not persist state: {e}")
++
++    # --- low-level painting ------------------------------------------------
++
++    def _scaled(self, rgb, brightness: int):
++        return tuple(min(255, round(c * brightness / 100)) for c in rgb)
++
++    def _commit(self, mapping: Dict[int, Tuple[int, int, int]]) -> bool:
++        try:
++            self._kb.multi(mapping)
++            return True
++        except OSError as e:
++            log.error(f"LampArray: write failed ({e}); re-probing device")
++            self._kb = None
++            self._probe()
++            return False
++
++    def _fill(self, rgb) -> bool:
++        try:
++            self._kb.fill(rgb)
++            return True
++        except OSError as e:
++            log.error(f"LampArray: fill failed ({e}); re-probing device")
++            self._kb = None
++            self._probe()
++            return False
++
++    # --- animation ---------------------------------------------------------
++
++    def _stop_effect(self) -> None:
++        """Stop any running animation. Caller must NOT hold the lock."""
++        self._stop.set()
++        t = self._thread
++        if t is not None and t.is_alive():
++            t.join(timeout=1.0)
++        self._thread = None
++        self._stop.clear()
++
++    def _start_effect(self, mode, speed, brightness, direction, rgb) -> None:
++        self._stop_effect()
++        self._stop.clear()
++        self._thread = threading.Thread(
++            target=self._run_effect,
++            args=(mode, speed, brightness, direction, rgb),
++            name=f"lamparray-effect-{mode}",
++            daemon=True,
++        )
++        self._thread.start()
++
++    def _run_effect(self, mode, speed, brightness, direction, rgb) -> None:
++        """Render frames until told to stop. Runs on its own thread."""
++        try:
++            interval = max(self._kb.min_interval / 1e6, 0.033)
++        except Exception:  # noqa: BLE001
++            interval = 0.033
++        width = max(getattr(self._kb, "w", 1), 1)
++        height = max(getattr(self._kb, "h", 1), 1)
++        xs = {l["id"]: l["x"] / width for l in self._lamps}
++        ys = {l["id"]: l["y"] / height for l in self._lamps}
++        # speed 0-9 -> a sane multiplier; 0 is slow but not frozen
++        rate = 0.25 + speed * 0.25
++        twinkle: Dict[int, float] = {}
++        t0 = time.time()
++
++        def sc(c):
++            return self._scaled(c, brightness)
++
++        def hsv(h, s=1.0, v=1.0):
++            return sc(tuple(round(c * 255) for c in colorsys.hsv_to_rgb(h % 1.0, s, v)))
++
++        # direction 1 = right-to-left, 2 = left-to-right
++        sign = -1.0 if direction == 1 else 1.0
++
++        log.info(f"LampArray: effect mode={mode} speed={speed} "
++                 f"brightness={brightness} dir={direction} @ {1/interval:.0f}fps")
++        while not self._stop.is_set():
++            t = time.time() - t0
++            m: Dict[int, Tuple[int, int, int]] = {}
++            try:
++                if mode == MODE_BREATH:
++                    k = 0.06 + 0.94 * (math.sin(2 * math.pi * t * rate * 0.25) + 1) / 2
++                    c = sc(tuple(round(v * k) for v in rgb))
++                    m = {i: c for i in xs}
++                elif mode == MODE_NEON:
++                    c = hsv(t * rate * 0.12)
++                    m = {i: c for i in xs}
++                elif mode == MODE_WAVE:
++                    m = {i: hsv(t * rate * 0.2 + sign * -x) for i, x in xs.items()}
++                elif mode == MODE_SHIFT:
++                    base_h = colorsys.rgb_to_hsv(*(v / 255 for v in rgb))[0]
++                    m = {i: hsv(base_h + 0.15 * math.sin(2 * math.pi * (t * rate * 0.3 + sign * x)))
++                         for i, x in xs.items()}
++                elif mode == MODE_ZOOM:
++                    for i in xs:
++                        d = math.hypot(xs[i] - 0.5, (ys[i] - 0.5) * 0.3)
++                        k = (math.sin(2 * math.pi * (t * rate * 0.4 - d * 2.5)) + 1) / 2
++                        m[i] = sc(tuple(round(v * (0.04 + 0.96 * k)) for v in rgb))
++                elif mode == MODE_METEOR:
++                    head = (t * rate * 0.35 * sign) % 1.4 - 0.2
++                    for i, x in xs.items():
++                        d = (x - head) * sign
++                        k = math.exp(-max(d, 0.0) * 9) if d >= -0.02 else 0.0
++                        m[i] = sc(tuple(round(v * k) for v in rgb))
++                elif mode == MODE_TWINKLE:
++                    for i in xs:
++                        e = twinkle.get(i, 0.0)
++                        if e <= 0 and random.random() < 0.012 * (1 + speed * 0.3):
++                            e = 1.0
++                        twinkle[i] = max(0.0, e - interval * (0.7 + rate * 0.5))
++                        m[i] = sc(tuple(round(v * twinkle[i]) for v in rgb))
++                else:
++                    break
++                if m and not self._commit(m):
++                    break
++            except Exception as e:  # noqa: BLE001 - never let a frame kill the thread
++                log.error(f"LampArray: effect frame failed: {e}")
++                break
++            self._stop.wait(interval)
++        log.debug(f"LampArray: effect mode={mode} stopped")
++
++    # --- public API (mirrors DAMXManager's zone contract) ------------------
++
++    def set_per_zone_mode(self, zones: List[str], brightness: int) -> bool:
++        """Paint N equal left-to-right bands. `zones` is a list of rrggbb strings."""
++        if not self.available:
++            return False
++        self._stop_effect()
++        with self._lock:
++            try:
++                cols = [_hex_to_rgb(z) for z in zones]
++            except (ValueError, IndexError):
++                log.error(f"LampArray: bad zone colours {zones}")
++                return False
++            if not cols:
++                return False
++            width = max(getattr(self._kb, "w", 1), 1)
++            n = len(cols)
++            mapping = {}
++            for l in self._lamps:
++                idx = min(int(l["x"] / width * n), n - 1)
++                mapping[l["id"]] = self._scaled(cols[idx], brightness)
++            self._kb.autonomous(False)
++            if not self._commit(mapping):
++                return False
++            self.state["per_zone_mode"] = ",".join(zones) + f",{brightness}"
++            self.state["four_zone_mode"] = ""
++            self._save_state()
++            log.info(f"LampArray: zones {zones} @ {brightness}%")
++            return True
++
++    def set_four_zone_mode(self, mode: int, speed: int, brightness: int,
++                           direction: int, red: int, green: int, blue: int) -> bool:
++        """Static colour (mode 0) or a rendered animation (modes 1-7)."""
++        if not self.available:
++            return False
++        self._stop_effect()
++        with self._lock:
++            rgb = (red, green, blue)
++            if mode == MODE_STATIC:
++                self._kb.autonomous(False)
++                if not self._fill(self._scaled(rgb, brightness)):
++                    return False
++            elif mode in ANIMATED_MODES:
++                self._kb.autonomous(False)
++                self._start_effect(mode, speed, brightness, direction, rgb)
++            else:
++                log.error(f"LampArray: unsupported mode {mode}")
++                return False
++            self.state["four_zone_mode"] = \
++                f"{mode},{speed},{brightness},{direction},{red},{green},{blue}"
++            self.state["per_zone_mode"] = ""
++            self._save_state()
++            return True
++
++    def get_per_zone_mode(self) -> str:
++        return self.state.get("per_zone_mode", "")
++
++    def get_four_zone_mode(self) -> str:
++        return self.state.get("four_zone_mode", "")
++
++    def restore(self) -> bool:
++        """Re-apply the last committed setting (firmware does not persist colours)."""
++        if not self.available:
++            return False
++        fz = self.state.get("four_zone_mode", "")
++        pz = self.state.get("per_zone_mode", "")
++        try:
++            if fz:
++                parts = [int(x) for x in fz.split(",")]
++                return self.set_four_zone_mode(*parts)
++            if pz:
++                parts = pz.split(",")
++                return self.set_per_zone_mode(parts[:-1], int(parts[-1]))
++        except (ValueError, TypeError) as e:
++            log.warning(f"LampArray: cannot restore saved state ({e})")
++        return False
++
++    def shutdown(self) -> None:
++        self._stop_effect()
+diff --git a/LAMPARRAY-INTEGRATION.md b/LAMPARRAY-INTEGRATION.md
+new file mode 100644
+index 0000000..56497e5
+--- /dev/null
++++ b/LAMPARRAY-INTEGRATION.md
+@@ -0,0 +1,172 @@
++# LampArray per-key RGB integration
++
++Adds support for per-key RGB keyboards that speak **HID LampArray** to Div-Acer-Manager-Max,
++for Acer models where `linuwu_sense` cannot drive the keyboard at all.
++
++Developed and verified on: Acer Predator Helios 16 **PH16-72**, Ubuntu 24.04.5, kernel
++6.8.0-136, keyboard `05af:666a` (103 per-key lamps).
++
++---
++
++## Problem
++
++On the PH16-72 the keyboard is **per-key RGB on a separate USB device**, not a four-zone EC
++function. `linuwu_sense` maps this model to `quirk_acer_predator_v4`, which does not set
++`.four_zone_kb`, so the driver never creates the `four_zoned_kb` sysfs group.
++
++Consequences in stock DAMX:
++
++| | |
++|---|---|
++| `has_four_zone_kb` | `False` |
++| `per_zone_mode` / `four_zone_mode` features | not advertised |
++| Keyboard Lighting tab | hidden |
++| Keyboard colour control | none |
++
++This is not a DAMX bug. There is genuinely no WMI interface to talk to — the hardware is
++reached over `/dev/hidraw*` instead.
++
++## Approach
++
++The keyboard implements the standard USB-IF **LampArray** protocol (usage page `0x59`,
++HUT 1.5 §25 — what Windows Dynamic Lighting uses), so no reverse-engineering is involved.
++
++The integration follows the precedent already in this codebase: the **ENEK5130 HID backend**,
++an alternative transport that satisfies the existing sysfs-shaped contract when sysfs writes
++are ineffective. Rather than introduce a second protocol and a second set of GUI panels, the
++LampArray backend **implements the same zone-based contract the GUI already speaks**.
++
++```
++GUI  ──set_per_zone_mode / set_four_zone_mode──▶  DAMXManager
++                                                      │
++                     ┌────────────────────────────────┼────────────────────────┐
++                     ▼                                ▼                        ▼
++          LampArrayController                ENEK5130 HID                 linuwu_sense
++        (per-key, /dev/hidraw)             (vendor reports)              (four_zoned_kb)
++                     │
++                     └── transport reused from lamparray-kbd (MIT), imported as a module
++```
++
++Mapping:
++
++| GUI concept | LampArray realisation |
++|---|---|
++| `per_zone_mode(z1..z4, brightness)` | keyboard split into 4 left-to-right bands using real lamp x-positions |
++| `four_zone_mode(mode=0, r,g,b)` | solid colour via `LampRangeUpdate` |
++| `four_zone_mode(mode=1..7)` | rendered by a background thread at 30 fps — LampArray is a static per-lamp protocol with no firmware effect engine |
++
++**The GUI required no changes.** Its panels gate on `IsFeatureAvailable("per_zone_mode")` and
++`("four_zone_mode")`, which the daemon now advertises when a LampArray device is present.
++
++## Changes
++
++| File | Change |
++|---|---|
++| `DAMM-Daemon/LampArrayBackend.py` | **new** — `LampArrayController`: discovery, zone painting, static fill, 7 animated effects, state persistence, hot re-probe on device loss |
++| `DAMM-Daemon/DAMX-Daemon.py` | 10 edits — import, instantiate, feature advertisement, `get`/`set` for both zone modes, `get_all_settings` fields, shutdown hook |
++| `DAMM-Daemon/DAMX-Daemon.spec` | `hiddenimports=['LampArrayBackend']` |
++| `scripts/local-setup.sh` | `install_lamparray()` — installs the helper to `/usr/local/lib/damx/`, writes the udev rule, removes both on uninstall |
++
++### `get_all_settings` additions
++
++```jsonc
++{
++  "has_four_zone_kb": true,        // capability: any backend can drive zoned colour
++  "has_four_zone_kb_sysfs": false, // the literal linuwu_sense fact, unchanged
++  "keyboard_backend": "lamparray", // lamparray | enek5130 | linuwu_sense | none
++  "lamparray": {
++    "available": true,
++    "device_id": "05af:666a",
++    "device_path": "/dev/hidraw2",
++    "lamp_count": 103,
++    "implementation": "/usr/local/lib/damx/lamparray-kbd"
++  }
++}
++```
++
++`has_four_zone_kb` is deliberately redefined as **capability, not implementation** — three GUI
++sites gate their Apply handlers on it, and a LampArray keyboard genuinely satisfies that
++contract. `has_four_zone_kb_sysfs` preserves the literal hardware fact for anything that needs
++it.
++
++### Effect mapping
++
++`four_zone_mode` mode ids are honoured as documented by Linuwu-Sense. Speed 0-9 scales the
++animation rate; direction 1 = right-to-left, 2 = left-to-right.
++
++| Mode | Name | LampArray rendering |
++|---|---|---|
++| 0 | Static | solid fill, no thread |
++| 1 | Breathing | sinusoidal fade of the chosen colour |
++| 2 | Neon | full-keyboard hue cycle |
++| 3 | Wave | hue wave travelling along x, direction-aware |
++| 4 | Shifting | hue oscillation around the chosen colour, direction-aware |
++| 5 | Zoom | pulse radiating from centre |
++| 6 | Meteor | exponential-tail comet, direction-aware |
++| 7 | Twinkling | stochastic per-lamp sparkle decay |
++
++Frame interval is taken from the device's declared `MinUpdateInterval` (33 ms here), floored
++at 30 fps. Any new command preempts a running effect within one frame.
++
++## Dependencies
++
++`lamparray-kbd` (MIT) provides the HID transport. It is imported as a module so there is
++exactly one implementation of the protocol on the system. Search order:
++
++1. `$LAMPARRAY_KBD_PATH`
++2. `/usr/local/lib/damx/lamparray-kbd`  ← where the installer puts it
++3. `/usr/local/bin/`, `/usr/bin/`, `/opt/lamparray-kbd/`
++4. `/home/*/.local/bin/lamparray-kbd` and nearby source checkouts
++
++If none is found, `LampArrayController.available` is `False`, no features are advertised, and
++the daemon behaves exactly as before. The import is also wrapped so a missing
++`LampArrayBackend.py` cannot prevent the daemon from starting.
++
++## Install
++
++```bash
++cd Div-Acer-Manager-Max
++sudo ./scripts/local-setup.sh     # option 1 or 4
++```
++
++`install_lamparray()` runs before the daemon install. It prefers a local `lamparray-kbd/`
++checkout (including a sibling one two levels up), falls back to cloning upstream, and skips
++with a warning if neither works — it never aborts the install.
++
++## Verify
++
++```bash
++systemctl status damx-daemon.service
++journalctl -u damx-daemon -n 30 | grep -i lamparray
++#   LampArray per-key RGB: 05af:666a (103 lamps) on /dev/hidraw2
++```
++
++In the GUI, the **Keyboard Lighting** tab should now appear with both the zone-colour and
++lighting-effects panels.
++
++## Limitations
++
++- **Effects are host-rendered**, so they stop when the daemon stops. The firmware has no
++  effect engine reachable through LampArray.
++- **Four zones on a 103-key board** are bands computed from lamp x-positions. The protocol
++  supports true per-key colour; the GUI has no per-key surface, so this backend does not
++  expose one. Use the `lamparray-kbd keys` CLI, or the `predator` wrapper, for per-key work.
++- **The lid logo** (Darfon `0d62:ba51`) is a separate proprietary device and is not covered.
++- **Colours do not survive keyboard power-cycles** on their own. State is persisted to
++  `/etc/DAMX_Daemon/lamparray_state.json` and `LampArrayController.restore()` re-applies it;
++  wiring that to a resume hook is a possible improvement.
++
++## Testing performed
++
++Verified on the real device:
++
++- backend: discovery, 4-zone paint, static fill, all 7 effects running, preemption, invalid
++  mode rejection, restore, state persistence
++- daemon: feature detection, `get_all_settings` shape, socket dispatch of
++  `set_per_zone_mode` / `set_four_zone_mode` through `DaemonServer.process_command`,
++  validation still rejecting bad input
++- installer: local-source path, git-fallback path, and unreachable-repo path (returns 0)
++
++**Not verified:** the Avalonia GUI was not compiled — no .NET SDK on this machine. The GUI
++source is unmodified, and the change that makes its panels appear is on the daemon side and is
++covered by the tests above, but the end-to-end click-through has not been exercised.
+diff --git a/scripts/local-setup.sh b/scripts/local-setup.sh
+index 09c4506..b6eac41 100755
+--- a/scripts/local-setup.sh
++++ b/scripts/local-setup.sh
+@@ -17,6 +17,11 @@ MODULE_SIGNING_KEY="${MODULE_SIGNING_DIR}/DAMX-MOK.priv"
+ MODULE_SIGNING_CERT="${MODULE_SIGNING_DIR}/DAMX-MOK.der"
+ MODULE_SIGNING_REQUIRED=false
+ 
++# Per-key RGB helper for HID LampArray keyboards (Predator PH16-72 et al.)
++LAMPARRAY_DIR="/usr/local/lib/damx"
++LAMPARRAY_BIN="${LAMPARRAY_DIR}/lamparray-kbd"
++LAMPARRAY_REPO="https://github.com/usamathpc/lamparray-kbd"
++
+ # Legacy paths for cleanup (uppercase naming convention)
+ LEGACY_INSTALL_DIR="/opt/DAMX"
+ LEGACY_DAEMON_SERVICE_NAME="DAMX-Daemon.service"
+@@ -170,6 +175,13 @@ comprehensive_cleanup() {
+   # Remove nitro key configuration
+   rm -rf /etc/damx
+ 
++  # Remove LampArray helper, its udev rule and saved lighting state
++  rm -f "${LAMPARRAY_BIN}"
++  rmdir "${LAMPARRAY_DIR}" 2>/dev/null || true
++  rm -f /etc/udev/rules.d/70-lamparray-kbd.rules
++  rm -f /etc/DAMX_Daemon/lamparray_state.json
++  udevadm control --reload-rules 2>/dev/null || true
++
+   # Final systemd daemon reload
+   systemctl daemon-reload
+ 
+@@ -506,6 +518,57 @@ install_drivers() {
+   return 0
+ }
+ 
++install_lamparray() {
++  # The daemon's LampArray backend loads this script at runtime to drive per-key
++  # RGB keyboards (e.g. Acer 05af:666a) that expose no four_zoned_kb sysfs group.
++  # Optional: if absent the daemon simply reports no LampArray backend.
++  echo -e "${YELLOW}Installing LampArray per-key RGB helper...${NC}"
++
++  local src=""
++  local here
++  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++
++  for candidate in \
++      "${here}/lamparray-kbd/lamparray-kbd" \
++      "${here}/../lamparray-kbd/lamparray-kbd" \
++      "${here}/../../lamparray-kbd/lamparray-kbd" \
++      "./lamparray-kbd/lamparray-kbd"; do
++    if [ -f "$candidate" ]; then
++      src="$candidate"
++      break
++    fi
++  done
++
++  if [ -z "$src" ] && command -v git &> /dev/null; then
++    echo -e "${BLUE}Fetching lamparray-kbd...${NC}"
++    local tmp
++    tmp=$(mktemp -d)
++    if git clone --depth 1 "$LAMPARRAY_REPO" "$tmp/lamparray-kbd" &> /dev/null; then
++      src="$tmp/lamparray-kbd/lamparray-kbd"
++    fi
++  fi
++
++  if [ -z "$src" ] || [ ! -f "$src" ]; then
++    echo -e "${YELLOW}lamparray-kbd not found and could not be fetched.${NC}"
++    echo -e "${YELLOW}Per-key RGB will be unavailable; everything else still works.${NC}"
++    return 0
++  fi
++
++  install -d -m 755 "$LAMPARRAY_DIR"
++  install -m 755 "$src" "$LAMPARRAY_BIN"
++
++  # udev uaccess so the standalone CLI works without root. The daemon runs as
++  # root and does not need this, but installing it costs nothing.
++  if "$LAMPARRAY_BIN" list 2>/dev/null | grep -q .; then
++    "$LAMPARRAY_BIN" install-udev &> /dev/null && \
++      echo -e "${GREEN}LampArray udev rule installed.${NC}"
++    echo -e "${GREEN}LampArray keyboard: $("$LAMPARRAY_BIN" list 2>/dev/null | head -1)${NC}"
++  else
++    echo -e "${BLUE}LampArray helper installed; no LampArray keyboard on this machine.${NC}"
++  fi
++  return 0
++}
++
+ install_daemon() {
+   echo -e "${YELLOW}Installing DAMX-Daemon...${NC}"
+ 
+@@ -523,6 +586,13 @@ install_daemon() {
+   cp -f DAMX-Daemon/DAMX-Daemon ${INSTALL_DIR}/daemon/
+   chmod +x ${INSTALL_DIR}/daemon/DAMX-Daemon
+ 
++  # The daemon may ship either as a PyInstaller binary (self-contained) or as a
++  # plain Python script, in which case its sibling modules must travel with it.
++  for module in DAMX-Daemon/*.py; do
++    [ -e "$module" ] || continue
++    cp -f "$module" ${INSTALL_DIR}/daemon/
++  done
++
+   # Create systemd service file with improved configuration
+   cat > ${SYSTEMD_DIR}/${DAEMON_SERVICE_NAME} << EOL
+ [Unit]
+@@ -814,6 +884,8 @@ perform_install() {
+     DRIVER_RESULT=0
+   fi
+ 
++  install_lamparray
++
+   install_daemon
+   DAEMON_RESULT=$?
+ 
